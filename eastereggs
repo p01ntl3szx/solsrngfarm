@@ -1,0 +1,775 @@
+--// SERVICES
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+local startTime = tick()
+
+local espConnections = {}
+
+--// SETTINGS
+local RUNNING = false
+local ESP_ENABLED = true
+
+local BLACKLIST = {
+	["Egg_1"]=true,["Egg_2"]=true,["Egg_3"]=true,
+	["Egg_4"]=true,["Egg_5"]=true,["Egg_6"]=true
+}
+
+local failedEggs = {}
+local pathFailures = {}
+local badPositions = {}
+
+--// =========================
+--// CONSOLE
+--// =========================
+
+pcall(function()
+	if game.CoreGui:FindFirstChild("EggConsole") then
+		game.CoreGui.EggConsole:Destroy()
+	end
+end)
+
+local gui = Instance.new("ScreenGui", game.CoreGui)
+gui.Name = "EggConsole"
+
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 420, 0, 260)
+frame.Position = UDim2.new(0.05, 0, 0.55, 0)
+frame.BackgroundColor3 = Color3.fromRGB(10,10,15)
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0,10)
+
+local header = Instance.new("Frame", frame)
+header.Size = UDim2.new(1,0,0,30)
+header.BackgroundColor3 = Color3.fromRGB(40,0,70)
+
+local title = Instance.new("TextLabel", header)
+title.Size = UDim2.new(1,-60,1,0)
+title.Position = UDim2.new(0,10,0,0)
+title.BackgroundTransparency = 1
+title.Text = "Egg Console"
+title.Font = Enum.Font.Code
+title.TextColor3 = Color3.fromRGB(200,150,255)
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local toggleBtn = Instance.new("TextButton", header)
+toggleBtn.Size = UDim2.new(0,30,1,0)
+toggleBtn.Position = UDim2.new(1,-30,0,0)
+toggleBtn.Text = "-"
+toggleBtn.BackgroundTransparency = 1
+toggleBtn.TextColor3 = Color3.fromRGB(200,150,255)
+
+local scroll = Instance.new("ScrollingFrame", frame)
+scroll.Position = UDim2.new(0,5,0,35)
+scroll.Size = UDim2.new(1,-10,1,-40)
+scroll.BackgroundTransparency = 1
+scroll.ScrollBarThickness = 6
+
+local layout = Instance.new("UIListLayout", scroll)
+
+local resize = Instance.new("Frame", frame)
+resize.Size = UDim2.new(0,15,0,15)
+resize.Position = UDim2.new(1,-15,1,-15)
+resize.BackgroundColor3 = Color3.fromRGB(140,0,255)
+
+local MAX_LOGS = 50
+
+local COLORS = {
+	info = Color3.fromRGB(180,120,255),
+	success = Color3.fromRGB(100,255,140),
+	error = Color3.fromRGB(255,90,90),
+	warn = Color3.fromRGB(255,200,120)
+}
+
+local function time()
+	local t = os.date("*t")
+	return string.format("%02d:%02d:%02d", t.hour, t.min, t.sec)
+end
+
+local logQueue = {}
+
+function Log(msg, logType)
+	logType = logType or "info"
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1,-5,0,20)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Code
+	label.TextSize = 14
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextColor3 = COLORS[logType] or COLORS.info
+	label.Text = "["..time().."] "..msg
+	label.Parent = scroll
+
+	-- ✅ store in queue (ordered)
+	table.insert(logQueue, label)
+
+	-- ✅ remove oldest properly
+	if #logQueue > MAX_LOGS then
+		local oldest = table.remove(logQueue, 1)
+		if oldest then
+			oldest:Destroy()
+		end
+	end
+
+	-- update scroll
+	scroll.CanvasSize = UDim2.new(0,0,0,layout.AbsoluteContentSize.Y)
+	scroll.CanvasPosition = Vector2.new(0, scroll.CanvasSize.Y.Offset)
+end
+
+-- toggle console
+UIS.InputBegan:Connect(function(input, gpe)
+	if not gpe and input.KeyCode == Enum.KeyCode.RightShift then
+		frame.Visible = not frame.Visible
+	end
+end)
+
+-- collapse
+local collapsed = false
+toggleBtn.MouseButton1Click:Connect(function()
+	collapsed = not collapsed
+	scroll.Visible = not collapsed
+	resize.Visible = not collapsed
+	frame.Size = collapsed and UDim2.new(0,420,0,30) or UDim2.new(0,420,0,260)
+	toggleBtn.Text = collapsed and "+" or "-"
+end)
+
+-- drag
+local dragging, dragStart, startPos
+header.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragStart = i.Position
+		startPos = frame.Position
+	end
+end)
+
+header.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = false
+	end
+end)
+
+UIS.InputChanged:Connect(function(i)
+	if dragging then
+		local delta = i.Position - dragStart
+		frame.Position = startPos + UDim2.new(0,delta.X,0,delta.Y)
+	end
+end)
+
+-- resize
+local resizing = false
+resize.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		resizing = true
+	end
+end)
+
+resize.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		resizing = false
+	end
+end)
+
+UIS.InputChanged:Connect(function(i)
+	if resizing then
+		frame.Size = UDim2.new(0,i.Position.X-frame.AbsolutePosition.X,0,i.Position.Y-frame.AbsolutePosition.Y)
+	end
+end)
+
+Log("Console ready","success")
+
+--// =========================
+--// TOGGLE WINDOW
+--// =========================
+
+local toggleGui = Instance.new("ScreenGui", game.CoreGui)
+
+local toggleFrame = Instance.new("Frame", toggleGui)
+toggleFrame.Size = UDim2.new(0,200,0,110)
+toggleFrame.Position = UDim2.new(0.02,0,0.5,0)
+toggleFrame.BackgroundColor3 = Color3.fromRGB(20,20,30)
+Instance.new("UICorner", toggleFrame)
+
+local header2 = Instance.new("TextLabel", toggleFrame)
+header2.Size = UDim2.new(1,0,0,25)
+header2.Text = "Controls"
+header2.BackgroundColor3 = Color3.fromRGB(40,0,70)
+header2.TextColor3 = Color3.fromRGB(200,150,255)
+header2.Font = Enum.Font.Code
+header2.TextSize = 14
+
+-- drag toggles
+local dragging2, start2, pos2
+header2.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging2 = true
+		start2 = i.Position
+		pos2 = toggleFrame.Position
+	end
+end)
+
+UIS.InputChanged:Connect(function(i)
+	if dragging2 then
+		local delta = i.Position - start2
+		toggleFrame.Position = pos2 + UDim2.new(0,delta.X,0,delta.Y)
+	end
+end)
+
+header2.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging2 = false
+	end
+end)
+
+local function makeToggle(text,y,callback)
+	local btn = Instance.new("TextButton", toggleFrame)
+	btn.Size = UDim2.new(1,-10,0,30)
+	btn.BackgroundColor3 = Color3.fromRGB(76, 76, 217)
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.Position = UDim2.new(0,5,0,y)
+
+	local state = false
+	btn.Text = text..": OFF"
+
+	btn.MouseButton1Click:Connect(function()
+		state = not state
+		btn.Text = text..": "..(state and "ON" or "OFF")
+		callback(state)
+	end)
+end
+
+makeToggle("Autofarm",30,function(v) RUNNING=v end)
+makeToggle("ESP",65,function(v) ESP_ENABLED=v end)
+
+--// =========================
+--// STATS WINDOW
+--// =========================
+
+local statsGui = Instance.new("ScreenGui", game.CoreGui)
+
+local statsFrame = Instance.new("Frame", statsGui)
+statsFrame.Size = UDim2.new(0,200,0,100)
+statsFrame.Position = UDim2.new(0.02,0,0.35,0)
+statsFrame.BackgroundColor3 = Color3.fromRGB(20,20,30)
+Instance.new("UICorner", statsFrame)
+
+local statsHeader = Instance.new("TextLabel", statsFrame)
+statsHeader.Size = UDim2.new(1,0,0,25)
+statsHeader.Text = "Farm Stats"
+statsHeader.BackgroundColor3 = Color3.fromRGB(40,0,70)
+statsHeader.TextColor3 = Color3.fromRGB(200,150,255)
+statsHeader.Font = Enum.Font.Code
+statsHeader.TextSize = 14
+
+local eggsLabel = Instance.new("TextLabel", statsFrame)
+eggsLabel.Position = UDim2.new(0,10,0,35)
+eggsLabel.Size = UDim2.new(1,-20,0,20)
+eggsLabel.BackgroundTransparency = 1
+eggsLabel.Font = Enum.Font.Code
+eggsLabel.TextColor3 = Color3.fromRGB(255,255,255)
+eggsLabel.TextSize = 14
+eggsLabel.TextXAlignment = Enum.TextXAlignment.Left
+eggsLabel.Text = "Eggs: 0"
+
+local coinsLabel = Instance.new("TextLabel", statsFrame)
+coinsLabel.Position = UDim2.new(0,10,0,60)
+coinsLabel.Size = UDim2.new(1,-20,0,20)
+coinsLabel.BackgroundTransparency = 1
+coinsLabel.Font = Enum.Font.Code
+coinsLabel.TextColor3 = Color3.fromRGB(255,255,255)
+coinsLabel.TextSize = 14
+coinsLabel.TextXAlignment = Enum.TextXAlignment.Left
+coinsLabel.Text = "Coins: 0"
+
+local timeLabel = Instance.new("TextLabel", statsFrame)
+timeLabel.Position = UDim2.new(0,10,0,80)
+timeLabel.Size = UDim2.new(1,-20,0,20)
+timeLabel.BackgroundTransparency = 1
+timeLabel.Font = Enum.Font.Code
+timeLabel.TextColor3 = Color3.fromRGB(200,200,200)
+timeLabel.TextSize = 14
+timeLabel.TextXAlignment = Enum.TextXAlignment.Left
+timeLabel.Text = "Time: 0s"
+
+task.spawn(function()
+	while true do
+		local elapsed = math.floor(tick() - startTime)
+		timeLabel.Text = "Time: "..elapsed.."s"
+		task.wait(1)
+	end
+end)
+
+-- drag
+local draggingStats, statsStart, statsPos
+statsHeader.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		draggingStats = true
+		statsStart = i.Position
+		statsPos = statsFrame.Position
+	end
+end)
+
+statsHeader.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then
+		draggingStats = false
+	end
+end)
+
+UIS.InputChanged:Connect(function(i)
+	if draggingStats then
+		local delta = i.Position - statsStart
+		statsFrame.Position = statsPos + UDim2.new(0,delta.X,0,delta.Y)
+	end
+end)
+
+
+
+-- stats values
+local totalEggs = 0
+local totalCoins = 0
+
+local function updateStats()
+	local elapsed = tick() - startTime
+
+	local eggsPerMin = 0
+	local coinsPerHour = 0
+
+	if elapsed > 0 then
+		eggsPerMin = (totalEggs / elapsed) * 60
+		coinsPerHour = (totalCoins / elapsed) * 3600
+	end
+
+	eggsLabel.Text = "Eggs: "..totalEggs.." ("..math.floor(eggsPerMin).."/m)"
+	coinsLabel.Text = "Coins: "..totalCoins.." ("..math.floor(coinsPerHour).."/h)"
+end
+
+--// =========================
+--// ESP
+--// =========================
+
+local espFolder = Instance.new("Folder", workspace)
+
+local function clearESP()
+	espFolder:ClearAllChildren()
+	for _, c in pairs(espConnections) do
+		c:Disconnect()
+	end
+	espConnections = {}
+end
+
+local function createESP(egg)
+	if not ESP_ENABLED then return end
+	if not egg.part then return end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.new(0,200,0,50)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = egg.part
+	billboard.Parent = espFolder
+
+	local text = Instance.new("TextLabel")
+	text.Size = UDim2.new(1,0,1,0)
+	text.BackgroundTransparency = 1
+	text.TextColor3 = Color3.fromRGB(170,0,255)
+	text.Font = Enum.Font.Code
+	text.TextScaled = true
+	text.Parent = billboard
+
+	local conn
+	conn = RunService.RenderStepped:Connect(function()
+		if not egg.part or not egg.part.Parent then
+			if conn then conn:Disconnect() end
+			return
+		end
+
+		local char = player.Character
+		if char and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - egg.part.Position).Magnitude
+			text.Text = egg.part.Name.." - ["..math.floor(dist).."]"
+		end
+	end)
+
+	table.insert(espConnections, conn)
+end
+
+--// =========================
+--// EGGS
+--// =========================
+
+local function isValidEgg(v)
+	if not v:IsA("BasePart") then return false end
+	if BLACKLIST[v.Name] then return false end
+
+	local name = string.lower(v.Name)
+
+	-- allow ALL eggs
+	if name == "egg" then return true end
+	if name:find("egg") then return true end
+
+	return false
+end
+
+local cachedEggs = {}
+
+local function refreshEggs()
+	cachedEggs = {}
+
+	for _, v in pairs(workspace:GetDescendants()) do
+		if isValidEgg(v) then
+			local prompt = v:FindFirstChildWhichIsA("ProximityPrompt", true)
+
+			table.insert(cachedEggs, {
+				part = v,
+				prompt = prompt
+			})
+		end
+	end
+end
+
+task.spawn(function()
+	while true do
+		refreshEggs()
+		task.wait(3)
+	end
+end)
+
+local function getEggs()
+	if ESP_ENABLED then
+		clearESP()
+		for _, v in pairs(cachedEggs) do
+			createESP(v)
+		end
+	end
+	return cachedEggs
+end
+
+local function isBadPosition(pos)
+	for _, p in pairs(badPositions) do
+		if (p - pos).Magnitude < 8 then
+			return true
+		end
+	end
+	return false
+end
+
+local function closestEgg(root)
+	local best, dist = nil, math.huge
+	for _, egg in pairs(getEggs()) do
+		local d = (root.Position - egg.part.Position).Magnitude
+		-- avoid bad areas
+		if isBadPosition(egg.part.Position) then
+			d = d + 200
+		end
+
+		if failedEggs[egg] then
+			local t = tick() - failedEggs[egg]
+
+			if t < 5 then
+				d = d + 100 -- avoid briefly
+			else
+				failedEggs[egg] = nil -- retry later
+			end
+		end
+
+		if d < dist then
+			dist = d
+			best = egg
+		end
+	end
+	return best
+end
+
+--// =========================
+--// PATH
+--// =========================
+
+local pathFolder = Instance.new("Folder", workspace)
+
+local currentPathParts = {}
+
+local function drawPath(points)
+	-- clear old
+	for _, p in pairs(currentPathParts) do
+		if p then p:Destroy() end
+	end
+	currentPathParts = {}
+
+	for i, wp in ipairs(points) do
+		local p = Instance.new("Part")
+		p.Size = Vector3.new(0.6,0.6,0.6)
+		p.Position = wp.Position + Vector3.new(0,0.2,0)
+		p.Anchored = true
+		p.CanCollide = false
+		p.Material = Enum.Material.Neon
+		p.Color = Color3.fromRGB(170,0,255)
+		p.Parent = pathFolder
+
+		currentPathParts[i] = p
+	end
+
+	return currentPathParts
+end
+
+local lastPathTime = 0
+
+local function walkTo(root, humanoid, dest)
+	local lastPos = root.Position
+	local stuckTime = 0
+
+	while RUNNING do
+		-- avoid known bad spots
+		if isBadPosition(dest) then
+			Log("Skipping bad location","warn")
+			return false
+		end
+
+		local path = PathfindingService:CreatePath({
+			AgentCanJump = true,
+			AgentJumpHeight = 8,
+			AgentRadius = 2,
+			AgentMaxSlope = 45
+		})
+
+		path:ComputeAsync(root.Position, dest)
+
+		if path.Status ~= Enum.PathStatus.Success then
+			Log("Path failed → marking bad","warn")
+			table.insert(badPositions, dest)
+			return false
+		end
+
+		local waypoints = path:GetWaypoints()
+
+		-- ✅ RESTORE PATH VISUALS
+		local visuals = drawPath(waypoints)
+
+		for i, wp in ipairs(waypoints) do
+			-- ✅ JUMP FIX
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+			end
+
+			humanoid:MoveTo(wp.Position)
+
+			local reached = humanoid.MoveToFinished:Wait()
+
+			-- remove path dot
+			if visuals and visuals[i] then
+				visuals[i]:Destroy()
+			end
+
+			-- STUCK DETECTION
+			if (root.Position - lastPos).Magnitude < 1 then
+				stuckTime = stuckTime + 1
+			else
+				stuckTime = 0
+			end
+
+			lastPos = root.Position
+
+			if stuckTime >= 3 then
+				Log("Stuck → strafing + marking bad","warn")
+
+				-- 🧠 remember bad location
+				table.insert(badPositions, root.Position)
+
+				-- 🧠 better unstuck (circle strafe)
+				for i = 1,3 do
+					local offset = Vector3.new(
+						math.random(-6,6),
+						0,
+						math.random(-6,6)
+					)
+					humanoid:MoveTo(root.Position + offset)
+					task.wait(0.4)
+				end
+
+				return false
+			end
+
+			if not reached then
+				break
+			end
+		end
+
+		if (root.Position - dest).Magnitude < 6 then
+			return true
+		end
+
+		task.wait(0.2)
+	end
+
+	return false
+end
+
+--// =========================
+--// COLLECTION
+--// =========================
+
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local function pressE()
+	VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+	task.wait(0.1)
+	VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+end
+
+local EGG_REWARDS = {
+	["point_egg_1"] = 50,
+	["point_egg_2"] = 100,
+	["point_egg_3"] = 150,
+	["point_egg_4"] = 200,
+	["point_egg_5"] = 300,
+	["point_egg_6"] = 500
+}
+
+local function collectEgg(egg, root, humanoid)
+	if not egg or not egg.part then return false end
+
+	local attempts = 0
+
+	while attempts < 8 do
+		attempts = attempts + 1
+
+		if not egg.part or not egg.part.Parent then
+			return true
+		end
+
+		local prompt = egg.part:FindFirstChildWhichIsA("ProximityPrompt", true)
+
+		local targetPos = egg.part.Position
+
+		if prompt then
+			if prompt.Parent:IsA("BasePart") then
+				targetPos = prompt.Parent.Position
+			elseif prompt.Parent:IsA("Attachment") then
+				targetPos = prompt.Parent.WorldPosition
+			end
+		end
+
+		local dist = (root.Position - targetPos).Magnitude
+
+		-- move closer aggressively
+		if dist > 8 then
+			humanoid:MoveTo(targetPos)
+			task.wait(0.3)
+		else
+			-- micro adjust (VERY IMPORTANT)
+			humanoid:MoveTo(targetPos + Vector3.new(math.random(-2,2),0,math.random(-2,2)))
+			task.wait(0.2)
+
+			pressE()
+
+			local success = false
+			local startTime = tick()
+			local initialPos = targetPos
+
+			while tick() - startTime < 2 do
+				-- egg removed
+				if not egg.part or not egg.part.Parent then
+					success = true
+					break
+				end
+
+				-- egg moved (some games do this)
+				if (egg.part.Position - initialPos).Magnitude > 3 then
+					success = true
+					break
+				end
+
+				-- player moved away = likely collected
+				if (root.Position - targetPos).Magnitude > 10 then
+					success = true
+					break
+				end
+
+				task.wait(0.05)
+			end
+
+			if success then
+				local rawName = string.lower(egg.part.Name)
+
+				local rewardValue = 0
+				for k, v in pairs(EGG_REWARDS) do
+					if rawName:find(k) then
+						rewardValue = v
+						break
+					end
+				end
+
+				local rewardText = rewardValue > 0 and ("+"..rewardValue.." Easter Coins") or "+ Egg"
+
+				totalEggs = totalEggs + 1
+				totalCoins = totalCoins + rewardValue
+				updateStats()
+
+				Log("Collected "..egg.part.Name.." - "..rewardText, "success")
+				return true
+			end
+		end
+
+		task.wait(0.25)
+	end
+
+	failedEggs[egg] = tick()
+	Log("Failed "..egg.part.Name.." after retries","error")
+
+	return false
+end
+
+--// =========================
+--// MAIN LOOP
+--// =========================
+
+local lastTargetEgg = nil
+
+task.spawn(function()
+	while true do
+		if RUNNING then
+			local char = player.Character or player.CharacterAdded:Wait()
+			local root = char:WaitForChild("HumanoidRootPart")
+			local humanoid = char:WaitForChild("Humanoid")
+
+			local egg = closestEgg(root)
+
+			-- skip eggs that failed too much
+			if egg and pathFailures[egg] and pathFailures[egg] >= 5 then
+				failedEggs[egg] = tick()
+				egg = nil
+			end
+
+			if egg then
+				if lastTargetEgg ~= egg then
+					lastTargetEgg = egg
+					Log("Going to "..egg.part.Name)
+				end
+
+				local success = walkTo(root, humanoid, egg.part.Position)
+
+				if not success then
+					pathFailures[egg] = (pathFailures[egg] or 0) + 1
+
+					if pathFailures[egg] >= 3 then
+						Log("Path fail → skipping egg","warn")
+						failedEggs[egg] = tick()
+						success = false
+					end
+				else
+					pathFailures[egg] = 0
+				end
+				if success then
+					if not collectEgg(egg, root, ohumanoid) then
+						Log("Failed "..egg.part.Name,"error")
+					end
+				end
+				lastTargetEgg = nil
+			end
+		end
+		task.wait(0.3)
+	end
+end)
