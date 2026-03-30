@@ -6,6 +6,16 @@ local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 
+--// WATER = VOID FIX
+for _, v in pairs(workspace:GetDescendants()) do
+	if v:IsA("BasePart") and v.Name == "WaterBlock" then
+		local mod = Instance.new("PathfindingModifier")
+		mod.PassThrough = false
+		mod.Label = "Blocked"
+		mod.Parent = v
+	end
+end
+
 local startTime = tick()
 
 local espConnections = {}
@@ -24,6 +34,7 @@ local pathFailures = {}
 local badPositions = {}
 local retryState = {}
 local strategyMemory = {}
+local successMemory = {}
 
 --// =========================
 --// CONSOLE
@@ -539,7 +550,23 @@ local function closestEgg(root)
 	for _, egg in pairs(eggs) do
 		if failedEggs[egg.part] ~= math.huge then
 			
+			local heightDiff = math.abs(root.Position.Y - egg.part.Position.Y)
 			local d = (root.Position - egg.part.Position).Magnitude
+
+			if successMemory[egg.part] then
+				d = d - 50 -- prioritize known good routes
+			end
+
+			-- penalize unreachable heights
+			if heightDiff > 25 then
+				d = d + 300
+			elseif heightDiff > 12 then
+				d = d + 120
+			end
+
+			if not isActuallyReachable(root.Position, egg.part.Position) then
+				d = d + 400
+			end
 
 			-- avoid bad areas
 			if isBadPosition(egg.part.Position) then
@@ -564,6 +591,48 @@ local function closestEgg(root)
 		end
 	end
 	return best
+end
+
+local function findPlatformsAround(pos)
+	local platforms = {}
+
+	local region = Region3.new(
+		pos - Vector3.new(20, 10, 20),
+		pos + Vector3.new(20, 20, 20)
+	)
+
+	local parts = workspace:FindPartsInRegion3(region, nil, 100)
+
+	for _, p in ipairs(parts) do
+		if p:IsA("BasePart") and p.CanCollide then
+			if p.Size.Y < 10 then -- avoid giant terrain
+				table.insert(platforms, p.Position)
+			end
+		end
+	end
+
+	return platforms
+end
+
+local function isActuallyReachable(startPos, targetPos)
+	local ray = workspace:Raycast(
+		startPos,
+		(targetPos - startPos),
+		RaycastParams.new()
+	)
+
+	-- if nothing blocking → likely reachable by jump
+	if not ray then
+		return true
+	end
+
+	-- check if there's ground near target
+	local down = workspace:Raycast(
+		targetPos + Vector3.new(0,5,0),
+		Vector3.new(0,-15,0)
+	)
+
+	return down ~= nil
 end
 
 local function getStrafePositions(rootPos, targetPos, attempt)
@@ -676,10 +745,77 @@ local function findJumpPoint(root, targetPos)
 	return best
 end
 
+local function tryParkour(root, humanoid, dest)
+	local platforms = findPlatformsAround(root.Position)
+
+	table.sort(platforms, function(a, b)
+		return (a - dest).Magnitude < (b - dest).Magnitude
+	end)
+
+	for i = 1, math.min(5, #platforms) do
+		local pos = platforms[i]
+
+		Log("Trying platform jump","info")
+
+		humanoid:MoveTo(pos)
+		humanoid.Jump = true
+
+		task.wait(0.4)
+
+		if (root.Position - pos).Magnitude < 5 then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function isGapAhead(root, direction)
+	local origin = root.Position + Vector3.new(0, 2, 0)
+
+	local forwardCheck = workspace:Raycast(origin, direction * 6)
+
+	if forwardCheck then
+		local downCheck = workspace:Raycast(forwardCheck.Position, Vector3.new(0, -15, 0))
+
+		if not downCheck then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function longJump(root, target)
+	local dir = (target - root.Position)
+	local flatDir = Vector3.new(dir.X, 0, dir.Z).Unit
+
+	root.Velocity = Vector3.new(
+		flatDir.X * 70,
+		75,
+		flatDir.Z * 70
+	)
+
+	task.wait(0.4)
+end
+
 local function walkTo(root, humanoid, dest)
 	local character = player.Character
 	local lastPos = root.Position
 	local stuckTime = 0
+
+	local lastMoveCheck = tick()
+
+	if tick() - lastMoveCheck > 0.2 then
+		if (root.Position - lastPos).Magnitude < 0.5 then
+			stuckTime = stuckTime + 1
+		else
+			stuckTime = 0
+		end
+
+		lastPos = root.Position
+		lastMoveCheck = tick()
+	end
 
 	while RUNNING do
 		-- avoid known bad spots
@@ -689,16 +825,31 @@ local function walkTo(root, humanoid, dest)
 		end
 
 		local path = PathfindingService:CreatePath({
-			AgentCanJump = true,
-			AgentJumpHeight = 8,
 			AgentRadius = 2,
-			AgentMaxSlope = 45
+			AgentHeight = 5,
+			AgentCanJump = true,
+			AgentJumpHeight = 12,
+			AgentMaxSlope = 50,
+			WaypointSpacing = 2,
+
+			Costs = {
+				Blocked = math.huge
+			}
 		})
 
 		path:ComputeAsync(root.Position, dest)
 
 		if path.Status ~= Enum.PathStatus.Success then
-			Log("Path failed → trying strategies","warn")
+			Log("Path failed → checking jump","warn")
+
+			local ray = workspace:Raycast(root.Position, (dest - root.Position))
+
+			if not ray then
+				longJump(root, dest)
+				return false
+			end
+
+			tryParkour(root, humanoid, dest)
 
 			local attempts = (lastTargetEgg and strategyMemory[lastTargetEgg.part]) or 1
 
@@ -712,7 +863,7 @@ local function walkTo(root, humanoid, dest)
 					task.wait(1.5)
 
 					humanoid:MoveTo(dest)
-					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+					humanoid.Jump = true
 
 					task.wait(0.8)
 					return false
@@ -734,109 +885,93 @@ local function walkTo(root, humanoid, dest)
 		local visuals = drawPath(waypoints)
 
 		for i, wp in ipairs(waypoints) do
-
-			if isPlayerOverriding() then
-				Log("Player override → pausing path","warn")
-
-				-- STOP movement immediately
-				humanoid:MoveTo(root.Position)
-
-				-- wait until player stops moving
-				repeat task.wait(0.2) until not isPlayerOverriding()
-
-				Log("Resuming path...","info")
-				return false -- force path recalculation
-			end
-
-			-- climb detection
-			local ray = Ray.new(root.Position, (wp.Position - root.Position).Unit * 4)
-			local hit = workspace:FindPartOnRay(ray, root.Parent)
-
-			if hit and hit:IsA("TrussPart") then
-				humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
-			end
-
-			-- jump handling
-			if wp.Action == Enum.PathWaypointAction.Jump then
-				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-			end
-
-			humanoid:MoveTo(wp.Position)
-
 			local reached = false
 
-			local conn
-			conn = humanoid.MoveToFinished:Connect(function(r)
-				reached = r
-			end)
+			while not reached do
+				-- SMART STUCK DETECTION
+				if (root.Position - lastPos).Magnitude < 0.5 then
+					stuckTime = stuckTime + 1
+				else
+					stuckTime = 0
+				end
 
-			local timeout = 0
+				lastPos = root.Position
 
-			while not reached and timeout < 50 do
+				if stuckTime > 15 then
+					Log("Recovery","warn")
+
+					-- mark this area as bad
+					table.insert(badPositions, root.Position)
+
+					if #badPositions > 25 then
+						table.remove(badPositions, 1)
+					end
+
+					-- 🔥 ADD THIS LINE (FIX #4)
+					if lastTargetEgg and lastTargetEgg.part then
+						failedEggs[lastTargetEgg.part] = tick()
+					end
+
+					-- strafe movement (escape)
+					local strafePoints = getStrafePositions(root.Position, dest, 2)
+
+					for _, pos in ipairs(strafePoints) do
+						humanoid:MoveTo(pos)
+						task.wait(0.25)
+					end
+
+					return false -- recalc path
+				end
 				if isPlayerOverriding() then
-					Log("Player override → stopping instantly","warn")
-
-					humanoid:MoveTo(root.Position)
-					conn:Disconnect()
-
-					repeat task.wait(0.2) until not isPlayerOverriding()
-
-					Log("Resuming path...","info")
+					humanoid:Move(Vector3.zero, true)
 					return false
 				end
 
-				timeout = timeout + 1
-				task.wait(0.1)
-			end
+				local dir = (wp.Position - root.Position)
+				local dist = dir.Magnitude
 
-			if timeout >= 50 then
-				LogOnce("movetimeout", "Move timeout → recalculating", 2)
-				conn:Disconnect()
-				return false
-			end
+				if dist < 2 then
+					reached = true
+					break
+				end
 
-			conn:Disconnect()
+				dir = dir.Unit
 
-			-- remove path dot
-			if visuals and visuals[i] then
-				visuals[i]:Destroy()
-			end
+				-- smooth continuous movement
+				humanoid:Move(dir, true)
 
-			-- stuck detection
-			if (root.Position - lastPos).Magnitude < 1 then
-				stuckTime = stuckTime + 1
-			else
-				stuckTime = 0
-			end
+				-- jump handling
+				if wp.Action == Enum.PathWaypointAction.Jump then
+					humanoid.Jump = true
+				end
 
-			lastPos = root.Position
+				-- small ledge fix
+				local ray = Ray.new(root.Position + Vector3.new(0,2,0), dir * 3)
+				local hit = workspace:FindPartOnRay(ray, character)
 
-			if stuckTime >= 3 then
-				Log("Stuck → strafing + marking bad","warn")
-
-				table.insert(badPositions, root.Position)
-
-				pathFailures[lastTargetEgg] = (pathFailures[lastTargetEgg] or 0) + 1
-
-				local attempts = pathFailures[lastTargetEgg] or 1
-				local strafePoints = getStrafePositions(root.Position, dest, attempts)
-
-				for _, pos in ipairs(strafePoints) do
-					humanoid:MoveTo(pos)
-					task.wait(0.35)
-
-					-- break early if unstuck
-					if (root.Position - lastPos).Magnitude > 2 then
-						break
+				if hit then
+					local heightDiff = hit.Position.Y - root.Position.Y
+					if heightDiff > 1.5 and heightDiff < 4 then
+						humanoid.Jump = true
 					end
 				end
 
-				return false
+				RunService.Heartbeat:Wait() -- IMPORTANT: use RenderStepped-like speed
 			end
+		end
 
-			if not reached then
-				break
-			end
+		-- detect gap (water / void)
+		local downRay = Ray.new(root.Position, Vector3.new(0,-10,0))
+		local ground = workspace:FindPartOnRay(downRay, character)
+
+		if not ground then
+
+			local dir = (dest - root.Position).Unit
+			
+			humanoid:Move(dir, true)
+			humanoid.Jump = true
+
+			task.wait(0.4)
 		end
 
 		local dist = (root.Position - dest).Magnitude
@@ -849,7 +984,7 @@ local function walkTo(root, humanoid, dest)
 				Log("Gap detected → attempting jump","warn")
 
 				humanoid:MoveTo(dest)
-				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+				humanoid.Jump = true
 
 				task.wait(0.5)
 			end
@@ -859,7 +994,7 @@ local function walkTo(root, humanoid, dest)
 			return true
 		end
 
-		task.wait(0.2)
+		task.wait(0.05)
 	end
 
 	return false
@@ -986,6 +1121,16 @@ end
 
 local lastTargetEgg = nil
 
+local function hardReset(humanoid, root)
+	Log("Hard reset triggered","error")
+
+	humanoid:MoveTo(root.Position)
+	humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+
+	task.wait(0.3)
+
+	humanoid:ChangeState(Enum.HumanoidStateType.Running)
+end
 task.spawn(function()
 	while true do
 		if RUNNING then
@@ -1017,6 +1162,7 @@ task.spawn(function()
 					local success = walkTo(root, humanoid, egg.part.Position)
 
 					if success then
+						if not lastTargetEgg or not lastTargetEgg.part then return false end
 						pathFailures[egg.part] = 0
 						strategyMemory[egg.part] = 0
 
@@ -1028,6 +1174,8 @@ task.spawn(function()
 						strategyMemory[egg.part] = (strategyMemory[egg.part] or 0) + 1
 
 						if pathFailures[egg.part] >= 3 then
+							hardReset(humanoid, root)
+
 							local otherEgg = closestEgg(root)
 
 							if otherEgg and otherEgg ~= egg then
