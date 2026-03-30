@@ -23,6 +23,7 @@ local failedEggs = {}
 local pathFailures = {}
 local badPositions = {}
 local retryState = {}
+local strategyMemory = {}
 
 --// =========================
 --// CONSOLE
@@ -436,8 +437,6 @@ UIS.InputChanged:Connect(function(i)
 	end
 end)
 
-
-
 -- stats values
 local totalEggs = 0
 local totalCoins = 0
@@ -538,7 +537,7 @@ local function closestEgg(root)
 	local best, dist = nil, math.huge
 	local eggs = getEggs() or {}
 	for _, egg in pairs(eggs) do
-		if failedEggs[egg] ~= math.huge then
+		if failedEggs[egg.part] ~= math.huge then
 			
 			local d = (root.Position - egg.part.Position).Magnitude
 
@@ -547,13 +546,13 @@ local function closestEgg(root)
 				d = d + 200
 			end
 
-			if failedEggs[egg] then
-				local t = tick() - failedEggs[egg]
+			if failedEggs[egg.part] then
+				local t = tick() - failedEggs[egg.part]
 
 				if t < 5 then
 					d = d + 100
 				else
-					failedEggs[egg] = nil
+					failedEggs[egg.part] = nil
 				end
 			end
 
@@ -643,7 +642,42 @@ end
 
 local lastPathTime = 0
 
+local function findJumpPoint(root, targetPos)
+	local best = nil
+	local bestScore = math.huge
+
+	for i = 1, 25 do
+		local offset = Vector3.new(
+			math.random(-40,40),
+			math.random(5,25), -- prefer higher spots
+			math.random(-40,40)
+		)
+
+		local pos = root.Position + offset
+
+		local ray = Ray.new(pos, Vector3.new(0,-50,0))
+		local hit = workspace:FindPartOnRay(ray)
+
+		if hit then
+			local groundPos = hit.Position
+
+			local distToTarget = (groundPos - targetPos).Magnitude
+
+			-- prefer positions closer to target AND higher
+			local score = distToTarget - (groundPos.Y * 0.5)
+
+			if score < bestScore then
+				bestScore = score
+				best = groundPos
+			end
+		end
+	end
+
+	return best
+end
+
 local function walkTo(root, humanoid, dest)
+	local character = player.Character
 	local lastPos = root.Position
 	local stuckTime = 0
 
@@ -664,23 +698,43 @@ local function walkTo(root, humanoid, dest)
 		path:ComputeAsync(root.Position, dest)
 
 		if path.Status ~= Enum.PathStatus.Success then
+			Log("Path failed → trying strategies","warn")
+
+			local attempts = (lastTargetEgg and strategyMemory[lastTargetEgg.part]) or 1
+
+			if attempts >= 3 then
+				local jumpPoint = findJumpPoint(root, dest)
+
+				if jumpPoint then
+					Log("Jump point found → repositioning","info")
+
+					humanoid:MoveTo(jumpPoint)
+					task.wait(1.5)
+
+					humanoid:MoveTo(dest)
+					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+
+					task.wait(0.8)
+					return false
+				end
+			end
+
+			-- fallback
 			LogOnce("pathfail_mark", "Path failed → marking bad", 2)
 			table.insert(badPositions, dest)
 
 			if #badPositions > 20 then
 				table.remove(badPositions, 1)
 			end
+
 			return false
 		end
 
 		local waypoints = path:GetWaypoints()
-
-		-- ✅ RESTORE PATH VISUALS
 		local visuals = drawPath(waypoints)
 
 		for i, wp in ipairs(waypoints) do
 
-			-- ✅ PLAYER OVERRIDE FIX
 			if isPlayerOverriding() then
 				Log("Player override → pausing path","warn")
 
@@ -692,6 +746,14 @@ local function walkTo(root, humanoid, dest)
 
 				Log("Resuming path...","info")
 				return false -- force path recalculation
+			end
+
+			-- climb detection
+			local ray = Ray.new(root.Position, (wp.Position - root.Position).Unit * 4)
+			local hit = workspace:FindPartOnRay(ray, root.Parent)
+
+			if hit and hit:IsA("TrussPart") then
+				humanoid:ChangeState(Enum.HumanoidStateType.Climbing)
 			end
 
 			-- jump handling
@@ -774,6 +836,22 @@ local function walkTo(root, humanoid, dest)
 
 			if not reached then
 				break
+			end
+		end
+
+		local dist = (root.Position - dest).Magnitude
+
+		if dist < 35 and dist > 8 then
+			local ray = Ray.new(root.Position, (dest - root.Position))
+			local hit = workspace:FindPartOnRay(ray, character)
+
+			if not hit then
+				Log("Gap detected → attempting jump","warn")
+
+				humanoid:MoveTo(dest)
+				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+
+				task.wait(0.5)
 			end
 		end
 
@@ -896,7 +974,7 @@ local function collectEgg(egg, root, humanoid)
 		task.wait(0.25)
 	end
 
-	failedEggs[egg] = tick()
+	failedEggs[egg.part] = tick()
 	Log("Failed "..egg.part.Name.." after retries","error")
 
 	return false
@@ -918,8 +996,8 @@ task.spawn(function()
 			local egg = closestEgg(root)
 
 			-- skip eggs that failed too much
-			if egg and pathFailures[egg] and pathFailures[egg] >= 5 then
-				failedEggs[egg] = tick()
+			if egg and pathFailures[egg.part] and pathFailures[egg.part] >= 5 then
+				failedEggs[egg.part] = tick()
 				egg = nil
 			end
 
@@ -939,30 +1017,32 @@ task.spawn(function()
 					local success = walkTo(root, humanoid, egg.part.Position)
 
 					if success then
-						pathFailures[egg] = 0
+						pathFailures[egg.part] = 0
+						strategyMemory[egg.part] = 0
 
 						if not collectEgg(egg, root, humanoid) then
 							Log("Failed "..egg.part.Name,"error")
 						end
 					else
-						pathFailures[egg] = (pathFailures[egg] or 0) + 1
+						pathFailures[egg.part] = (pathFailures[egg.part] or 0) + 1
+						strategyMemory[egg.part] = (strategyMemory[egg.part] or 0) + 1
 
-						if pathFailures[egg] >= 3 then
+						if pathFailures[egg.part] >= 3 then
 							local otherEgg = closestEgg(root)
 
 							if otherEgg and otherEgg ~= egg then
 								Log("Switching egg after 3 fails","warn")
-								failedEggs[egg] = tick()
-								retryState[egg] = (retryState[egg] or 0) + 1
+								failedEggs[egg.part] = tick()
+								retryState[egg.part] = (retryState[egg.part] or 0) + 1
 							else
-								retryState[egg] = (retryState[egg] or 0) + 1
+								retryState[egg.part] = (retryState[egg.part] or 0) + 1
 
-								if retryState[egg] >= 2 then
+								if retryState[egg.part] >= 2 then
 									Log("Giving up on "..egg.part.Name,"error")
-									failedEggs[egg] = math.huge
+									failedEggs[egg.part] = math.huge
 								else
 									Log("Retrying same egg (no alternatives)","warn")
-									pathFailures[egg] = 0
+									pathFailures[egg.part] = 0
 								end
 							end
 						end
