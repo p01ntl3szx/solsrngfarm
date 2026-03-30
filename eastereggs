@@ -763,7 +763,7 @@ task.spawn(function()
 					pathFailures[egg] = 0
 				end
 				if success then
-					if not collectEgg(egg, root, ohumanoid) then
+					if not collectEgg(egg, root, humanoid) then
 						Log("Failed "..egg.part.Name,"error")
 					end
 				end
