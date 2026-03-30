@@ -22,6 +22,7 @@ local BLACKLIST = {
 local failedEggs = {}
 local pathFailures = {}
 local badPositions = {}
+local retryState = {}
 
 --// =========================
 --// CONSOLE
@@ -119,6 +120,15 @@ function Log(msg, logType)
 	-- update scroll
 	scroll.CanvasSize = UDim2.new(0,0,0,layout.AbsoluteContentSize.Y)
 	scroll.CanvasPosition = Vector2.new(0, scroll.CanvasSize.Y.Offset)
+end
+
+local lastWarnTime = {}
+
+local function LogOnce(key, msg, delay)
+	if not lastWarnTime[key] or tick() - lastWarnTime[key] > delay then
+		lastWarnTime[key] = tick()
+		Log(msg, "warn")
+	end
 end
 
 -- toggle console
@@ -244,7 +254,69 @@ local function makeToggle(text,y,callback)
 end
 
 makeToggle("Autofarm",30,function(v) RUNNING=v end)
-makeToggle("ESP",65,function(v) ESP_ENABLED=v end)
+
+
+--// =========================
+--// ESP
+--// =========================
+
+local espFolder = Instance.new("Folder", workspace)
+
+local function clearESP()
+	espFolder:ClearAllChildren()
+	for _, c in pairs(espConnections or {}) do
+		c:Disconnect()
+	end
+	espConnections = {}
+end
+
+local function createESP(egg)
+	if not ESP_ENABLED then return end
+	if not egg.part then return end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.new(0,200,0,50)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = egg.part
+	billboard.Parent = espFolder
+
+	local text = Instance.new("TextLabel")
+	text.Size = UDim2.new(1,0,1,0)
+	text.BackgroundTransparency = 1
+	text.TextColor3 = Color3.fromRGB(170,0,255)
+	text.Font = Enum.Font.Code
+	text.TextScaled = true
+	text.Parent = billboard
+
+	local conn
+	conn = RunService.RenderStepped:Connect(function()
+		if not egg.part or not egg.part.Parent then
+			if conn then conn:Disconnect() end
+			return
+		end
+
+		local char = player.Character
+		if char and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - egg.part.Position).Magnitude
+			text.Text = egg.part.Name.." - ["..math.floor(dist).."]"
+		end
+	end)
+
+	table.insert(espConnections, conn)
+end
+
+
+makeToggle("ESP",65,function(v)
+	ESP_ENABLED = v
+
+	clearESP()
+
+	if ESP_ENABLED then
+		for _, egg in pairs(cachedEggs or {}) do
+			createESP(egg)
+		end
+	end
+end)
 
 --// =========================
 --// STATS WINDOW
@@ -295,6 +367,43 @@ timeLabel.TextColor3 = Color3.fromRGB(200,200,200)
 timeLabel.TextSize = 14
 timeLabel.TextXAlignment = Enum.TextXAlignment.Left
 timeLabel.Text = "Time: 0s"
+
+local playerMoving = false
+local lastInputTime = 0
+
+UIS.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+
+	if input.UserInputType == Enum.UserInputType.Keyboard
+	or input.UserInputType == Enum.UserInputType.Gamepad1 then
+		playerMoving = true
+		lastInputTime = tick()
+	end
+end)
+
+local function isPlayerOverriding()
+	local char = player.Character
+	if not char then return false end
+
+	local humanoid = char:FindFirstChild("Humanoid")
+	if not humanoid then return false end
+
+	-- must be moving AND player recently pressed input
+	if humanoid.MoveDirection.Magnitude > 0.1 then
+		if tick() - lastInputTime < 0.4 then
+			return true
+		end
+	end
+
+	return false
+end
+
+UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Keyboard
+	or input.UserInputType == Enum.UserInputType.Gamepad1 then
+		lastInputTime = tick()
+	end
+end)
 
 task.spawn(function()
 	while true do
@@ -348,54 +457,6 @@ local function updateStats()
 	coinsLabel.Text = "Coins: "..totalCoins.." ("..math.floor(coinsPerHour).."/h)"
 end
 
---// =========================
---// ESP
---// =========================
-
-local espFolder = Instance.new("Folder", workspace)
-
-local function clearESP()
-	espFolder:ClearAllChildren()
-	for _, c in pairs(espConnections) do
-		c:Disconnect()
-	end
-	espConnections = {}
-end
-
-local function createESP(egg)
-	if not ESP_ENABLED then return end
-	if not egg.part then return end
-
-	local billboard = Instance.new("BillboardGui")
-	billboard.Size = UDim2.new(0,200,0,50)
-	billboard.AlwaysOnTop = true
-	billboard.Adornee = egg.part
-	billboard.Parent = espFolder
-
-	local text = Instance.new("TextLabel")
-	text.Size = UDim2.new(1,0,1,0)
-	text.BackgroundTransparency = 1
-	text.TextColor3 = Color3.fromRGB(170,0,255)
-	text.Font = Enum.Font.Code
-	text.TextScaled = true
-	text.Parent = billboard
-
-	local conn
-	conn = RunService.RenderStepped:Connect(function()
-		if not egg.part or not egg.part.Parent then
-			if conn then conn:Disconnect() end
-			return
-		end
-
-		local char = player.Character
-		if char and char:FindFirstChild("HumanoidRootPart") then
-			local dist = (char.HumanoidRootPart.Position - egg.part.Position).Magnitude
-			text.Text = egg.part.Name.." - ["..math.floor(dist).."]"
-		end
-	end)
-
-	table.insert(espConnections, conn)
-end
 
 --// =========================
 --// EGGS
@@ -434,18 +495,34 @@ end
 task.spawn(function()
 	while true do
 		refreshEggs()
-		task.wait(3)
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		if ESP_ENABLED then
+			clearESP()
+			for _, v in pairs(cachedEggs) do
+				createESP(v)
+			end
+		end
+		task.wait(2)
 	end
 end)
 
 local function getEggs()
-	if ESP_ENABLED then
-		clearESP()
-		for _, v in pairs(cachedEggs) do
-			createESP(v)
+	return cachedEggs or {}
+end
+
+local function getValidEggCount()
+	local count = 0
+	for _, egg in pairs(cachedEggs or {}) do
+		if egg and egg.part and egg.part.Parent then
+			count = count + 1
 		end
 	end
-	return cachedEggs
+	return count
 end
 
 local function isBadPosition(pos)
@@ -459,29 +536,78 @@ end
 
 local function closestEgg(root)
 	local best, dist = nil, math.huge
-	for _, egg in pairs(getEggs()) do
-		local d = (root.Position - egg.part.Position).Magnitude
-		-- avoid bad areas
-		if isBadPosition(egg.part.Position) then
-			d = d + 200
-		end
+	local eggs = getEggs() or {}
+	for _, egg in pairs(eggs) do
+		if failedEggs[egg] ~= math.huge then
+			
+			local d = (root.Position - egg.part.Position).Magnitude
 
-		if failedEggs[egg] then
-			local t = tick() - failedEggs[egg]
-
-			if t < 5 then
-				d = d + 100 -- avoid briefly
-			else
-				failedEggs[egg] = nil -- retry later
+			-- avoid bad areas
+			if isBadPosition(egg.part.Position) then
+				d = d + 200
 			end
-		end
 
-		if d < dist then
-			dist = d
-			best = egg
+			if failedEggs[egg] then
+				local t = tick() - failedEggs[egg]
+
+				if t < 5 then
+					d = d + 100
+				else
+					failedEggs[egg] = nil
+				end
+			end
+
+			if d < dist then
+				dist = d
+				best = egg
+			end
+
 		end
 	end
 	return best
+end
+
+local function getStrafePositions(rootPos, targetPos, attempt)
+	local positions = {}
+
+	local dir = (targetPos - rootPos).Unit
+	local right = Vector3.new(-dir.Z, 0, dir.X) -- perpendicular
+	local back = -dir
+
+	-- pattern scaling
+	local scale = 4 + (attempt * 2)
+
+	if attempt == 1 then
+		-- simple left/right
+		table.insert(positions, rootPos + right * scale)
+		table.insert(positions, rootPos - right * scale)
+
+	elseif attempt == 2 then
+		-- triangle movement
+		table.insert(positions, rootPos + right * scale)
+		table.insert(positions, rootPos + back * scale)
+		table.insert(positions, rootPos - right * scale)
+
+	elseif attempt == 3 then
+		-- circle around target
+		for i = 1, 6 do
+			local angle = math.rad(i * 60)
+			local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * scale
+			table.insert(positions, targetPos + offset)
+		end
+
+	else
+		-- chaos mode (last resort)
+		for i = 1, 5 do
+			table.insert(positions, rootPos + Vector3.new(
+				math.random(-10,10),
+				0,
+				math.random(-10,10)
+			))
+		end
+	end
+
+	return positions
 end
 
 --// =========================
@@ -494,7 +620,7 @@ local currentPathParts = {}
 
 local function drawPath(points)
 	-- clear old
-	for _, p in pairs(currentPathParts) do
+	for _, p in pairs(currentPathParts or {}) do
 		if p then p:Destroy() end
 	end
 	currentPathParts = {}
@@ -524,7 +650,7 @@ local function walkTo(root, humanoid, dest)
 	while RUNNING do
 		-- avoid known bad spots
 		if isBadPosition(dest) then
-			Log("Skipping bad location","warn")
+			LogOnce("badpos_"..tostring(dest), "Skipping bad location", 3)
 			return false
 		end
 
@@ -538,8 +664,12 @@ local function walkTo(root, humanoid, dest)
 		path:ComputeAsync(root.Position, dest)
 
 		if path.Status ~= Enum.PathStatus.Success then
-			Log("Path failed → marking bad","warn")
+			LogOnce("pathfail_mark", "Path failed → marking bad", 2)
 			table.insert(badPositions, dest)
+
+			if #badPositions > 20 then
+				table.remove(badPositions, 1)
+			end
 			return false
 		end
 
@@ -549,21 +679,68 @@ local function walkTo(root, humanoid, dest)
 		local visuals = drawPath(waypoints)
 
 		for i, wp in ipairs(waypoints) do
-			-- ✅ JUMP FIX
+
+			-- ✅ PLAYER OVERRIDE FIX
+			if isPlayerOverriding() then
+				Log("Player override → pausing path","warn")
+
+				-- STOP movement immediately
+				humanoid:MoveTo(root.Position)
+
+				-- wait until player stops moving
+				repeat task.wait(0.2) until not isPlayerOverriding()
+
+				Log("Resuming path...","info")
+				return false -- force path recalculation
+			end
+
+			-- jump handling
 			if wp.Action == Enum.PathWaypointAction.Jump then
 				humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 			end
 
 			humanoid:MoveTo(wp.Position)
 
-			local reached = humanoid.MoveToFinished:Wait()
+			local reached = false
+
+			local conn
+			conn = humanoid.MoveToFinished:Connect(function(r)
+				reached = r
+			end)
+
+			local timeout = 0
+
+			while not reached and timeout < 50 do
+				if isPlayerOverriding() then
+					Log("Player override → stopping instantly","warn")
+
+					humanoid:MoveTo(root.Position)
+					conn:Disconnect()
+
+					repeat task.wait(0.2) until not isPlayerOverriding()
+
+					Log("Resuming path...","info")
+					return false
+				end
+
+				timeout = timeout + 1
+				task.wait(0.1)
+			end
+
+			if timeout >= 50 then
+				LogOnce("movetimeout", "Move timeout → recalculating", 2)
+				conn:Disconnect()
+				return false
+			end
+
+			conn:Disconnect()
 
 			-- remove path dot
 			if visuals and visuals[i] then
 				visuals[i]:Destroy()
 			end
 
-			-- STUCK DETECTION
+			-- stuck detection
 			if (root.Position - lastPos).Magnitude < 1 then
 				stuckTime = stuckTime + 1
 			else
@@ -575,18 +752,21 @@ local function walkTo(root, humanoid, dest)
 			if stuckTime >= 3 then
 				Log("Stuck → strafing + marking bad","warn")
 
-				-- 🧠 remember bad location
 				table.insert(badPositions, root.Position)
 
-				-- 🧠 better unstuck (circle strafe)
-				for i = 1,3 do
-					local offset = Vector3.new(
-						math.random(-6,6),
-						0,
-						math.random(-6,6)
-					)
-					humanoid:MoveTo(root.Position + offset)
-					task.wait(0.4)
+				pathFailures[lastTargetEgg] = (pathFailures[lastTargetEgg] or 0) + 1
+
+				local attempts = pathFailures[lastTargetEgg] or 1
+				local strafePoints = getStrafePositions(root.Position, dest, attempts)
+
+				for _, pos in ipairs(strafePoints) do
+					humanoid:MoveTo(pos)
+					task.wait(0.35)
+
+					-- break early if unstuck
+					if (root.Position - lastPos).Magnitude > 2 then
+						break
+					end
 				end
 
 				return false
@@ -747,27 +927,47 @@ task.spawn(function()
 				if lastTargetEgg ~= egg then
 					lastTargetEgg = egg
 					Log("Going to "..egg.part.Name)
+				elseif (root.Position - egg.part.Position).Magnitude < 8 then
+					lastTargetEgg = nil -- stop log spam when already there
 				end
 
-				local success = walkTo(root, humanoid, egg.part.Position)
-
-				if not success then
-					pathFailures[egg] = (pathFailures[egg] or 0) + 1
-
-					if pathFailures[egg] >= 3 then
-						Log("Path fail → skipping egg","warn")
-						failedEggs[egg] = tick()
-						success = false
-					end
+				-- if already close, skip pathing and collect immediately
+				if (root.Position - egg.part.Position).Magnitude < 8 then
+					collectEgg(egg, root, humanoid)
+					task.wait(0.2)
 				else
-					pathFailures[egg] = 0
-				end
-				if success then
-					if not collectEgg(egg, root, humanoid) then
-						Log("Failed "..egg.part.Name,"error")
+					local success = walkTo(root, humanoid, egg.part.Position)
+
+					if success then
+						pathFailures[egg] = 0
+
+						if not collectEgg(egg, root, humanoid) then
+							Log("Failed "..egg.part.Name,"error")
+						end
+					else
+						pathFailures[egg] = (pathFailures[egg] or 0) + 1
+
+						if pathFailures[egg] >= 3 then
+							local otherEgg = closestEgg(root)
+
+							if otherEgg and otherEgg ~= egg then
+								Log("Switching egg after 3 fails","warn")
+								failedEggs[egg] = tick()
+								retryState[egg] = (retryState[egg] or 0) + 1
+							else
+								retryState[egg] = (retryState[egg] or 0) + 1
+
+								if retryState[egg] >= 2 then
+									Log("Giving up on "..egg.part.Name,"error")
+									failedEggs[egg] = math.huge
+								else
+									Log("Retrying same egg (no alternatives)","warn")
+									pathFailures[egg] = 0
+								end
+							end
+						end
 					end
 				end
-				lastTargetEgg = nil
 			end
 		end
 		task.wait(0.3)
