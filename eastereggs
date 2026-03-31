@@ -7,13 +7,17 @@ local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
 
 --// WATER = VOID FIX
+local waterBlocks = {}
+
 for _, v in pairs(workspace:GetDescendants()) do
-	if v:IsA("BasePart") and v.Name == "WaterBlock" then
-		local mod = Instance.new("PathfindingModifier")
-		mod.PassThrough = false
-		mod.Label = "Blocked"
-		mod.Parent = v
-	end
+    if v:IsA("BasePart") and v.Name == "WaterBlock" then
+        local mod = Instance.new("PathfindingModifier")
+        mod.PassThrough = false
+        mod.Label = "Blocked"
+        mod.Parent = v
+        
+        table.insert(waterBlocks, v)
+    end
 end
 
 local startTime = tick()
@@ -35,6 +39,7 @@ local badPositions = {}
 local retryState = {}
 local strategyMemory = {}
 local successMemory = {}
+
 
 --// =========================
 --// CONSOLE
@@ -380,43 +385,6 @@ timeLabel.TextSize = 14
 timeLabel.TextXAlignment = Enum.TextXAlignment.Left
 timeLabel.Text = "Time: 0s"
 
-local playerMoving = false
-local lastInputTime = 0
-
-UIS.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-
-	if input.UserInputType == Enum.UserInputType.Keyboard
-	or input.UserInputType == Enum.UserInputType.Gamepad1 then
-		playerMoving = true
-		lastInputTime = tick()
-	end
-end)
-
-local function isPlayerOverriding()
-	local char = player.Character
-	if not char then return false end
-
-	local humanoid = char:FindFirstChild("Humanoid")
-	if not humanoid then return false end
-
-	-- must be moving AND player recently pressed input
-	if humanoid.MoveDirection.Magnitude > 0.1 then
-		if tick() - lastInputTime < 0.4 then
-			return true
-		end
-	end
-
-	return false
-end
-
-UIS.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.Keyboard
-	or input.UserInputType == Enum.UserInputType.Gamepad1 then
-		lastInputTime = tick()
-	end
-end)
-
 task.spawn(function()
 	while true do
 		local elapsed = math.floor(tick() - startTime)
@@ -471,6 +439,174 @@ end
 --// =========================
 --// EGGS
 --// =========================
+
+local function isActuallyReachable(startPos, targetPos)
+	local ray = workspace:Raycast(
+		startPos,
+		(targetPos - startPos),
+		RaycastParams.new()
+	)
+
+	-- if nothing blocking → likely reachable by jump
+	if not ray then
+		return true
+	end
+
+	-- check if there's ground near target
+	local down = workspace:Raycast(
+		targetPos + Vector3.new(0,5,0),
+		Vector3.new(0,-15,0)
+	)
+
+	return down ~= nil
+end
+
+local function findPlatformsAround(pos)
+	local platforms = {}
+
+	local region = Region3.new(
+		pos - Vector3.new(20, 10, 20),
+		pos + Vector3.new(20, 20, 20)
+	)
+
+	local parts = workspace:FindPartsInRegion3(region, nil, 100)
+
+	for _, p in ipairs(parts) do
+		if p:IsA("BasePart") and p.CanCollide then
+			if p.Size.Y < 10 then -- avoid giant terrain
+				table.insert(platforms, p.Position)
+			end
+		end
+	end
+
+	return platforms
+end
+
+local function getStrafePositions(rootPos, targetPos, attempt)
+	local positions = {}
+
+	local dir = (targetPos - rootPos).Unit
+	local right = Vector3.new(-dir.Z, 0, dir.X) -- perpendicular
+	local back = -dir
+
+	-- pattern scaling
+	local scale = 4 + (attempt * 2)
+
+	if attempt == 1 then
+		-- simple left/right
+		table.insert(positions, rootPos + right * scale)
+		table.insert(positions, rootPos - right * scale)
+
+	elseif attempt == 2 then
+		-- triangle movement
+		table.insert(positions, rootPos + right * scale)
+		table.insert(positions, rootPos + back * scale)
+		table.insert(positions, rootPos - right * scale)
+
+	elseif attempt == 3 then
+		-- circle around target
+		for i = 1, 6 do
+			local angle = math.rad(i * 60)
+			local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * scale
+			table.insert(positions, targetPos + offset)
+		end
+
+	else
+		-- chaos mode (last resort)
+		for i = 1, 5 do
+			table.insert(positions, rootPos + Vector3.new(
+				math.random(-10,10),
+				0,
+				math.random(-10,10)
+			))
+		end
+	end
+
+	return positions
+end
+
+local function findJumpPoint(root, targetPos)
+	local best = nil
+	local bestScore = math.huge
+
+	for i = 1, 25 do
+		local offset = Vector3.new(
+			math.random(-40,40),
+			math.random(5,25), -- prefer higher spots
+			math.random(-40,40)
+		)
+
+		local pos = root.Position + offset
+
+		local ray = Ray.new(pos, Vector3.new(0,-50,0))
+		local hit = workspace:FindPartOnRay(ray)
+
+		if hit then
+			local groundPos = hit.Position
+
+			local distToTarget = (groundPos - targetPos).Magnitude
+
+			-- prefer positions closer to target AND higher
+			local score = distToTarget - (groundPos.Y * 0.5)
+
+			if score < bestScore then
+				bestScore = score
+				best = groundPos
+			end
+		end
+	end
+
+	return best
+end
+
+local lastPathTime = 0
+
+local function tryParkour(root, humanoid, dest)
+	local platforms = findPlatformsAround(root.Position)
+
+	table.sort(platforms, function(a, b)
+		return (a - dest).Magnitude < (b - dest).Magnitude
+	end)
+
+	for i = 1, math.min(5, #platforms) do
+		local pos = platforms[i]
+
+		Log("Trying platform jump","info")
+
+		humanoid:MoveTo(pos)
+		humanoid.Jump = true
+
+		task.wait(0.4)
+
+		if (root.Position - pos).Magnitude < 5 then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function longJump(root, target)
+	local dir = (target - root.Position)
+	local flatDir = Vector3.new(dir.X, 0, dir.Z).Unit
+
+	root.Velocity = Vector3.new(
+		flatDir.X * 70,
+		75,
+		flatDir.Z * 70
+	)
+
+	task.wait(0.4)
+end
+
+local function isBadPosition(pos)
+	for _, p in pairs(badPositions) do
+		if (p - pos).Magnitude < 8 then
+			return true
+		end
+	end
+	return false
+end
 
 local function isValidEgg(v)
 	if not v:IsA("BasePart") then return false end
@@ -535,20 +671,11 @@ local function getValidEggCount()
 	return count
 end
 
-local function isBadPosition(pos)
-	for _, p in pairs(badPositions) do
-		if (p - pos).Magnitude < 8 then
-			return true
-		end
-	end
-	return false
-end
-
 local function closestEgg(root)
 	local best, dist = nil, math.huge
 	local eggs = getEggs() or {}
 	for _, egg in pairs(eggs) do
-		if failedEggs[egg.part] ~= math.huge then
+		if egg and egg.part and failedEggs[egg.part] ~= math.huge then
 			
 			local heightDiff = math.abs(root.Position.Y - egg.part.Position.Y)
 			local d = (root.Position - egg.part.Position).Magnitude
@@ -593,95 +720,6 @@ local function closestEgg(root)
 	return best
 end
 
-local function findPlatformsAround(pos)
-	local platforms = {}
-
-	local region = Region3.new(
-		pos - Vector3.new(20, 10, 20),
-		pos + Vector3.new(20, 20, 20)
-	)
-
-	local parts = workspace:FindPartsInRegion3(region, nil, 100)
-
-	for _, p in ipairs(parts) do
-		if p:IsA("BasePart") and p.CanCollide then
-			if p.Size.Y < 10 then -- avoid giant terrain
-				table.insert(platforms, p.Position)
-			end
-		end
-	end
-
-	return platforms
-end
-
-local function isActuallyReachable(startPos, targetPos)
-	local ray = workspace:Raycast(
-		startPos,
-		(targetPos - startPos),
-		RaycastParams.new()
-	)
-
-	-- if nothing blocking → likely reachable by jump
-	if not ray then
-		return true
-	end
-
-	-- check if there's ground near target
-	local down = workspace:Raycast(
-		targetPos + Vector3.new(0,5,0),
-		Vector3.new(0,-15,0)
-	)
-
-	return down ~= nil
-end
-
-local function getStrafePositions(rootPos, targetPos, attempt)
-	local positions = {}
-
-	local dir = (targetPos - rootPos).Unit
-	local right = Vector3.new(-dir.Z, 0, dir.X) -- perpendicular
-	local back = -dir
-
-	-- pattern scaling
-	local scale = 4 + (attempt * 2)
-
-	if attempt == 1 then
-		-- simple left/right
-		table.insert(positions, rootPos + right * scale)
-		table.insert(positions, rootPos - right * scale)
-
-	elseif attempt == 2 then
-		-- triangle movement
-		table.insert(positions, rootPos + right * scale)
-		table.insert(positions, rootPos + back * scale)
-		table.insert(positions, rootPos - right * scale)
-
-	elseif attempt == 3 then
-		-- circle around target
-		for i = 1, 6 do
-			local angle = math.rad(i * 60)
-			local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * scale
-			table.insert(positions, targetPos + offset)
-		end
-
-	else
-		-- chaos mode (last resort)
-		for i = 1, 5 do
-			table.insert(positions, rootPos + Vector3.new(
-				math.random(-10,10),
-				0,
-				math.random(-10,10)
-			))
-		end
-	end
-
-	return positions
-end
-
---// =========================
---// PATH
---// =========================
-
 local pathFolder = Instance.new("Folder", workspace)
 
 local currentPathParts = {}
@@ -709,300 +747,327 @@ local function drawPath(points)
 	return currentPathParts
 end
 
-local lastPathTime = 0
-
-local function findJumpPoint(root, targetPos)
-	local best = nil
-	local bestScore = math.huge
-
-	for i = 1, 25 do
-		local offset = Vector3.new(
-			math.random(-40,40),
-			math.random(5,25), -- prefer higher spots
-			math.random(-40,40)
-		)
-
-		local pos = root.Position + offset
-
-		local ray = Ray.new(pos, Vector3.new(0,-50,0))
-		local hit = workspace:FindPartOnRay(ray)
-
-		if hit then
-			local groundPos = hit.Position
-
-			local distToTarget = (groundPos - targetPos).Magnitude
-
-			-- prefer positions closer to target AND higher
-			local score = distToTarget - (groundPos.Y * 0.5)
-
-			if score < bestScore then
-				bestScore = score
-				best = groundPos
-			end
-		end
-	end
-
-	return best
+-- ✅ LADDER DETECTION
+local function findNearbyLadder(rootPos, targetPos)
+    for _, v in pairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and string.find(string.lower(v.Name), "ladder") then
+            local distToPlayer = (v.Position - rootPos).Magnitude
+            local distToTarget = (v.Position - targetPos).Magnitude
+            -- Ladder must be reasonably close to both player and egg
+            if distToPlayer < 30 and distToTarget < 30 then
+                return v
+            end
+        end
+    end
+    return nil
 end
 
-local function tryParkour(root, humanoid, dest)
-	local platforms = findPlatformsAround(root.Position)
+local function tryClimbLadder(root, humanoid, targetPos)
+    local ladder = nil
+    for _, v in pairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and string.find(string.lower(v.Name), "ladder") then
+            local distToPlayer = (v.Position - root.Position).Magnitude
+            -- If a ladder is within 25 studs, we can try to grab it
+            if distToPlayer < 25 then
+                ladder = v
+                break
+            end
+        end
+    end
+    
+    if not ladder then return false end
+    
+    -- Calculate ladder top and bottom
+    local ladderTop = ladder.CFrame * CFrame.new(0, ladder.Size.Y/2, 0)
+    local ladderBottom = ladder.CFrame * CFrame.new(0, -ladder.Size.Y/2, 0)
+    
+    -- If we are already higher than the ladder, we don't need it
+    if ladderTop.Position.Y < root.Position.Y + 2 then return false end
 
-	table.sort(platforms, function(a, b)
-		return (a - dest).Magnitude < (b - dest).Magnitude
-	end)
+    Log("Found ladder: " .. ladder.Name .. " -> Jumping to clutch!", "info")
 
-	for i = 1, math.min(5, #platforms) do
-		local pos = platforms[i]
+    -- Walk to the base of the ladder
+    humanoid:MoveTo(ladderBottom.Position + Vector3.new(0, 1, 0))
+    task.wait(1.2)
 
-		Log("Trying platform jump","info")
+    -- Force jump to grab the ladder 5 studs up
+    local climbDir = (ladder.Position - root.Position).Unit
+    humanoid:MoveTo(ladderBottom.Position + Vector3.new(0, 5, 0))
+    humanoid.Jump = true
+    task.wait(0.15)
+    humanoid.Jump = true -- Double tap to ensure clutch
+    
+    -- Wait until the player's Y height reaches the top of the ladder
+    local climbTimeout = tick() + 8 -- Max 8 seconds to climb
 
-		humanoid:MoveTo(pos)
-		humanoid.Jump = true
+    while tick() < climbTimeout do
+        -- If we reached the top of the ladder
+        if root.Position.Y >= ladderTop.Position.Y - 2 then
+            Log("Reached top of ladder!", "success")
+            
+            -- Walk forward off the top of the ladder to cross the gap
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+            humanoid:MoveTo(ladderTop.Position + climbDir * 8)
+            task.wait(1.5)
+            
+            return true -- Success!
+        end
+        
+        -- If we fell back down, try jumping again
+        if math.abs(root.Position.Y - ladderBottom.Position.Y) < 2 then
+            humanoid:MoveTo(ladderBottom.Position + Vector3.new(0, 5, 0))
+            humanoid.Jump = true
+            task.wait(0.5)
+        end
+        
+        task.wait(0.1)
+    end
 
-		task.wait(0.4)
-
-		if (root.Position - pos).Magnitude < 5 then
-			return true
-		end
-	end
-
-	return false
+    Log("Failed to climb ladder", "error")
+    return false
 end
 
-local function isGapAhead(root, direction)
-	local origin = root.Position + Vector3.new(0, 2, 0)
+-- ✅ BULLETPROOF MOVEMENT SYSTEM
+-- This forces the character to move every single frame, ignoring whatever 
+-- game script or executor bug was stopping 'MoveTo' from working.
+local moveConn = nil
 
-	local forwardCheck = workspace:Raycast(origin, direction * 6)
-
-	if forwardCheck then
-		local downCheck = workspace:Raycast(forwardCheck.Position, Vector3.new(0, -15, 0))
-
-		if not downCheck then
-			return true
-		end
-	end
-
-	return false
+local function stopForcingMove()
+    if moveConn then
+        moveConn:Disconnect()
+        moveConn = nil
+    end
+    if player.Character and player.Character:FindFirstChild("Humanoid") then
+        player.Character.Humanoid:Move(Vector3.zero)
+    end
 end
 
-local function longJump(root, target)
-	local dir = (target - root.Position)
-	local flatDir = Vector3.new(dir.X, 0, dir.Z).Unit
+-- ✅ SMART ISLAND HOPPER (Chain-jumps across mini islands)
+local function smartIslandHop(root, humanoid, dest)
+    local startPos = root.Position
+    local targetXZ = Vector3.new(dest.X, 0, dest.Z)
+    local startXZ = Vector3.new(startPos.X, 0, startPos.Z)
+    
+    local totalDistXZ = (targetXZ - startXZ).Magnitude
+    if totalDistXZ < 4 then return false end
+    
+    local dirUnit = (targetXZ - startXZ).Unit
+    
+    -- Tell raycasts to completely ignore water blocks so we only see actual islands
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = waterBlocks
 
-	root.Velocity = Vector3.new(
-		flatDir.X * 70,
-		75,
-		flatDir.Z * 70
-	)
+    -- Make sure there isn't a giant wall in the way
+    local wallRay = workspace:Raycast(startPos + Vector3.new(0, 3, 0), dirUnit * totalDistXZ, rayParams)
+    if wallRay then
+        return false -- A solid wall is blocking us, can't jump over it
+    end
+    
+    local jumpPoints = {}
+    local currentXZ = startXZ
+    local maxJump = 13 -- 13 studs is your max jump distance with 18 walkspeed
 
-	task.wait(0.4)
+    -- Build a chain of islands to jump to
+    while (currentXZ - targetXZ).Magnitude > maxJump do
+        local found = false
+        
+        -- Look for the farthest possible island within jump range (13 down to 5 studs)
+        for step = maxJump, 5, -1 do
+            local checkXZ = currentXZ + (dirUnit * step)
+            local checkPos3D = Vector3.new(checkXZ.X, startPos.Y, checkXZ.Z)
+            
+            -- Shoot a ray straight down to find an island
+            local downRay = workspace:Raycast(checkPos3D + Vector3.new(0, 30, 0), Vector3.new(0, -60, 0), rayParams)
+            
+            if downRay then
+                -- Found an island! Add it to our path
+                table.insert(jumpPoints, downRay.Position + Vector3.new(0, 0.5, 0))
+                currentXZ = checkXZ
+                found = true
+                break
+            end
+        end
+        
+        if not found then
+            Log("Island gap too wide to jump!", "error")
+            return false -- Gap is > 13 studs, impossible to cross
+        end
+    end
+    
+    -- Add the final egg destination
+    table.insert(jumpPoints, dest + Vector3.new(0, 0.5, 0))
+    
+    Log("Found island hop path! ("..#jumpPoints.." jumps)", "success")
+    
+    -- Execute the jumps!
+    for _, point in ipairs(jumpPoints) do
+        local distToPoint = (root.Position - point).Magnitude
+        
+        -- Safety check
+        if distToPoint > 15 then
+            Log("Skipping impossible jump ("..math.floor(distToPoint).." studs)", "warn")
+            return false
+        end
+        
+        humanoid:MoveTo(point)
+        humanoid.Jump = true
+        
+        -- Wait to land on the island
+        local waitTime = 0
+        while (root.Position - point).Magnitude > 4 and waitTime < 2 do
+            task.wait(0.1)
+            waitTime = waitTime + 0.1
+        end
+        task.wait(0.2) -- Tiny pause to regain balance before next jump
+    end
+    
+    -- Check if we made it
+    return (root.Position - dest).Magnitude < 10
+end
+
+local function tryCliffDrop(root, humanoid, dest)
+    local heightDrop = root.Position.Y - dest.Y
+    
+    -- If the egg is more than 12 studs below us
+    if heightDrop > 12 then
+        Log("Egg is far below ("..math.floor(heightDrop).." studs) -> Dropping off cliff!", "info")
+        
+        -- Walk to the X/Z coordinates of the egg (this moves us to the edge)
+        local edgeTarget = Vector3.new(dest.X, root.Position.Y, dest.Z)
+        humanoid:MoveTo(edgeTarget)
+        
+        -- Wait until we are right above the egg or we walk off
+        local dropWait = 0
+        while (root.Position - edgeTarget).Magnitude > 4 and dropWait < 4 do
+            task.wait(0.1)
+            dropWait = dropWait + 0.1
+        end
+        
+        -- Walk straight down to the egg
+        humanoid:MoveTo(dest)
+        task.wait(1.5)
+        
+        -- Check if we landed near it
+        return (root.Position - dest).Magnitude < 15
+    end
+    
+    return false
 end
 
 local function walkTo(root, humanoid, dest)
-	local character = player.Character
-	local lastPos = root.Position
-	local stuckTime = 0
+    -- ✅ CRITICAL FIX: Force the character to be able to walk
+    -- If the game secretly set your speed to 0, this fixes it
+    if humanoid.PlatformStand then humanoid.PlatformStand = false end
+    if humanoid.WalkSpeed <= 0 then humanoid.WalkSpeed = 16 end
 
-	local lastMoveCheck = tick()
+    local lastPos = root.Position
+    local stuckTime = 0
 
-	if tick() - lastMoveCheck > 0.2 then
-		if (root.Position - lastPos).Magnitude < 0.5 then
-			stuckTime = stuckTime + 1
-		else
-			stuckTime = 0
-		end
+    local heightDiff = dest.Y - root.Position.Y
+    
+    -- If egg is high up, try ladder first
+    if heightDiff > 6 then
+        if tryClimbLadder(root, humanoid, dest) then
+            return false -- Recalculate path from top of ladder
+        end
+    end
 
-		lastPos = root.Position
-		lastMoveCheck = tick()
-	end
+    local path = PathfindingService:CreatePath({
+        AgentCanJump = true,
+        AgentJumpHeight = 12,
+        AgentRadius = 2,
+        AgentMaxSlope = 50,
+        Costs = { Blocked = math.huge }
+    })
 
-	while RUNNING do
-		-- avoid known bad spots
-		if isBadPosition(dest) then
-			LogOnce("badpos_"..tostring(dest), "Skipping bad location", 3)
-			return false
-		end
-
-		local path = PathfindingService:CreatePath({
-			AgentRadius = 2,
-			AgentHeight = 5,
-			AgentCanJump = true,
-			AgentJumpHeight = 12,
-			AgentMaxSlope = 50,
-			WaypointSpacing = 2,
-
-			Costs = {
-				Blocked = math.huge
-			}
-		})
-
-		path:ComputeAsync(root.Position, dest)
-
-		if path.Status ~= Enum.PathStatus.Success then
-			Log("Path failed → checking jump","warn")
-
-			local ray = workspace:Raycast(root.Position, (dest - root.Position))
-
-			if not ray then
-				longJump(root, dest)
-				return false
-			end
-
-			tryParkour(root, humanoid, dest)
-
-			local attempts = (lastTargetEgg and strategyMemory[lastTargetEgg.part]) or 1
-
-			if attempts >= 3 then
-				local jumpPoint = findJumpPoint(root, dest)
-
-				if jumpPoint then
-					Log("Jump point found → repositioning","info")
-
-					humanoid:MoveTo(jumpPoint)
-					task.wait(1.5)
-
-					humanoid:MoveTo(dest)
-					humanoid.Jump = true
-
-					task.wait(0.8)
-					return false
-				end
-			end
-
-			-- fallback
-			LogOnce("pathfail_mark", "Path failed → marking bad", 2)
-			table.insert(badPositions, dest)
-
-			if #badPositions > 20 then
-				table.remove(badPositions, 1)
-			end
-
-			return false
-		end
-
-		local waypoints = path:GetWaypoints()
-		local visuals = drawPath(waypoints)
-
-		for i, wp in ipairs(waypoints) do
-			local reached = false
-
-			while not reached do
-				-- SMART STUCK DETECTION
-				if (root.Position - lastPos).Magnitude < 0.5 then
-					stuckTime = stuckTime + 1
-				else
-					stuckTime = 0
-				end
-
-				lastPos = root.Position
-
-				if stuckTime > 15 then
-					Log("Recovery","warn")
-
-					-- mark this area as bad
-					table.insert(badPositions, root.Position)
-
-					if #badPositions > 25 then
-						table.remove(badPositions, 1)
-					end
-
-					-- 🔥 ADD THIS LINE (FIX #4)
-					if lastTargetEgg and lastTargetEgg.part then
-						failedEggs[lastTargetEgg.part] = tick()
-					end
-
-					-- strafe movement (escape)
-					local strafePoints = getStrafePositions(root.Position, dest, 2)
-
-					for _, pos in ipairs(strafePoints) do
-						humanoid:MoveTo(pos)
-						task.wait(0.25)
-					end
-
-					return false -- recalc path
-				end
-				if isPlayerOverriding() then
-					humanoid:Move(Vector3.zero, true)
-					return false
-				end
-
-				local dir = (wp.Position - root.Position)
-				local dist = dir.Magnitude
-
-				if dist < 2 then
-					reached = true
-					break
-				end
-
-				dir = dir.Unit
-
-				-- smooth continuous movement
-				humanoid:Move(dir, true)
-
-				-- jump handling
-				if wp.Action == Enum.PathWaypointAction.Jump then
-					humanoid.Jump = true
-				end
-
-				-- small ledge fix
-				local ray = Ray.new(root.Position + Vector3.new(0,2,0), dir * 3)
-				local hit = workspace:FindPartOnRay(ray, character)
-
-				if hit then
-					local heightDiff = hit.Position.Y - root.Position.Y
-					if heightDiff > 1.5 and heightDiff < 4 then
-						humanoid.Jump = true
-					end
-				end
-
-				RunService.Heartbeat:Wait() -- IMPORTANT: use RenderStepped-like speed
-			end
-		end
-
-		-- detect gap (water / void)
-		local downRay = Ray.new(root.Position, Vector3.new(0,-10,0))
-		local ground = workspace:FindPartOnRay(downRay, character)
-
-		if not ground then
-
-			local dir = (dest - root.Position).Unit
-			
-			humanoid:Move(dir, true)
-			humanoid.Jump = true
-
-			task.wait(0.4)
-		end
-
-		local dist = (root.Position - dest).Magnitude
-
-		if dist < 35 and dist > 8 then
-			local ray = Ray.new(root.Position, (dest - root.Position))
-			local hit = workspace:FindPartOnRay(ray, character)
-
-			if not hit then
-				Log("Gap detected → attempting jump","warn")
-
-				humanoid:MoveTo(dest)
-				humanoid.Jump = true
-
-				task.wait(0.5)
-			end
-		end
-
-		if (root.Position - dest).Magnitude < 6 then
+    path:ComputeAsync(root.Position, dest)
+    
+    if path.Status ~= Enum.PathStatus.Success then
+		Log("Normal path blocked -> checking smart fallbacks", "warn")
+		-- 1. Can we just drop down the cliff? (No fall damage!)
+		if tryCliffDrop(root, humanoid, dest) then
 			return true
 		end
 
-		task.wait(0.05)
+		-- 2. Can we island hop across the water?
+		if smartIslandHop(root, humanoid, dest) then
+			return true
+		end
+
+		-- 3. Can we find a ladder to jump up and cross the gap? 
+		-- (We run this even if the egg isn't high up, because the ladder might CROSS a gap)
+		if tryClimbLadder(root, humanoid, dest) then
+			return false -- Recalculate path from the new side
+		end
+				
+		-- 4. Absolute last resort: mark as bad and skip
+		table.insert(badPositions, dest)
+		if #badPositions > 20 then table.remove(badPositions, 1) end
+		return false
 	end
 
-	return false
-end
+    local waypoints = path:GetWaypoints()
+    local visuals = drawPath(waypoints)
 
---// =========================
---// COLLECTION
---// =========================
+    -- ✅ USING YOUR SECOND SCRIPT'S EXACT WALKING LOGIC
+    for i, wp in ipairs(waypoints) do
+        if not RUNNING then 
+            return false 
+        end
+
+        -- Force jump state (Roblox standard for pathfinding jumps)
+        if wp.Action == Enum.PathWaypointAction.Jump then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+
+        -- Force walkable state before EVERY single step
+        if humanoid.PlatformStand then humanoid.PlatformStand = false end
+        if humanoid.WalkSpeed <= 0 then humanoid.WalkSpeed = 16 end
+
+        -- ✅ THE HOLY GRAIL: MoveTo + Wait
+        -- This tells Roblox's core engine to walk. No loops, no overriding.
+        humanoid:MoveTo(wp.Position)
+        local reached = humanoid.MoveToFinished:Wait()
+
+        -- Remove path dot
+        if visuals and visuals[i] then
+            visuals[i]:Destroy()
+        end
+
+        -- STUCK DETECTION
+        if (root.Position - lastPos).Magnitude < 1 then
+            stuckTime = stuckTime + 1
+        else
+            stuckTime = 0
+        end
+        lastPos = root.Position
+
+        if stuckTime >= 3 then
+            Log("Stuck → strafing", "warn")
+            table.insert(badPositions, root.Position)
+            
+            -- Unstick
+            for j = 1, 3 do
+                local offset = Vector3.new(math.random(-6,6), 0, math.random(-6,6))
+                humanoid:MoveTo(root.Position + offset)
+                task.wait(0.4)
+            end
+            return false
+        end
+
+        -- ✅ If the player presses WASD, MoveToFinished AUTOMATICALLY returns false!
+        if not reached then
+            return false 
+        end
+    end
+
+    if (root.Position - dest).Magnitude < 6 then
+        return true
+    end
+
+    return false
+end
 
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
@@ -1100,6 +1165,7 @@ local function collectEgg(egg, root, humanoid)
 				totalEggs = totalEggs + 1
 				totalCoins = totalCoins + rewardValue
 				updateStats()
+				successMemory[egg.part] = true
 
 				Log("Collected "..egg.part.Name.." - "..rewardText, "success")
 				return true
@@ -1122,82 +1188,83 @@ end
 local lastTargetEgg = nil
 
 local function hardReset(humanoid, root)
-	Log("Hard reset triggered","error")
-
-	humanoid:MoveTo(root.Position)
-	humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-
-	task.wait(0.3)
-
-	humanoid:ChangeState(Enum.HumanoidStateType.Running)
+    Log("Hard reset triggered","error")
+    humanoid:MoveTo(root.Position)
+    humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+    task.wait(0.3)
+    humanoid:ChangeState(Enum.HumanoidStateType.Running)
 end
+
 task.spawn(function()
-	while true do
-		if RUNNING then
-			local char = player.Character or player.CharacterAdded:Wait()
-			local root = char:WaitForChild("HumanoidRootPart")
-			local humanoid = char:WaitForChild("Humanoid")
+    while true do
+        if RUNNING then
+            local char = player.Character or player.CharacterAdded:Wait()
+            local root = char:WaitForChild("HumanoidRootPart")
+            local humanoid = char:WaitForChild("Humanoid")
 
-			local egg = closestEgg(root)
+            local egg = closestEgg(root)
 
-			-- skip eggs that failed too much
-			if egg and pathFailures[egg.part] and pathFailures[egg.part] >= 5 then
-				failedEggs[egg.part] = tick()
-				egg = nil
-			end
+            -- skip eggs that failed too much
+            if egg and pathFailures[egg.part] and pathFailures[egg.part] >= 5 then
+                failedEggs[egg.part] = tick()
+                egg = nil
+            end
 
-			if egg then
-				if lastTargetEgg ~= egg then
-					lastTargetEgg = egg
-					Log("Going to "..egg.part.Name)
-				elseif (root.Position - egg.part.Position).Magnitude < 8 then
-					lastTargetEgg = nil -- stop log spam when already there
-				end
+            if egg then
+                if lastTargetEgg ~= egg then
+                    lastTargetEgg = egg
+                    Log("Going to "..egg.part.Name)
+                elseif (root.Position - egg.part.Position).Magnitude < 8 then
+                    lastTargetEgg = nil 
+                end
 
-				-- if already close, skip pathing and collect immediately
-				if (root.Position - egg.part.Position).Magnitude < 8 then
-					collectEgg(egg, root, humanoid)
-					task.wait(0.2)
-				else
-					local success = walkTo(root, humanoid, egg.part.Position)
+                local distToEgg = (root.Position - egg.part.Position).Magnitude
+                local heightDiff = math.abs(root.Position.Y - egg.part.Position.Y)
 
-					if success then
-						if not lastTargetEgg or not lastTargetEgg.part then return false end
-						pathFailures[egg.part] = 0
-						strategyMemory[egg.part] = 0
+                -- ✅ FIXED: Only collect immediately if close AND on the same level
+                -- If the egg is high up (heightDiff > 4), it forces walkTo to use the ladder logic!
+                if distToEgg < 8 and heightDiff < 4 then
+                    collectEgg(egg, root, humanoid)
+                    task.wait(0.2)
+                else
+                    local success = walkTo(root, humanoid, egg.part.Position)
 
-						if not collectEgg(egg, root, humanoid) then
-							Log("Failed "..egg.part.Name,"error")
-						end
-					else
-						pathFailures[egg.part] = (pathFailures[egg.part] or 0) + 1
-						strategyMemory[egg.part] = (strategyMemory[egg.part] or 0) + 1
+                    if success then
+                        pathFailures[egg.part] = 0
+                        strategyMemory[egg.part] = 0
 
-						if pathFailures[egg.part] >= 3 then
-							hardReset(humanoid, root)
+                        if not collectEgg(egg, root, humanoid) then
+                            Log("Failed "..egg.part.Name,"error")
+                        end
+                    else
+                        pathFailures[egg.part] = (pathFailures[egg.part] or 0) + 1
+                        strategyMemory[egg.part] = (strategyMemory[egg.part] or 0) + 1
 
-							local otherEgg = closestEgg(root)
+                        if pathFailures[egg.part] >= 3 then
+                            hardReset(humanoid, root)
 
-							if otherEgg and otherEgg ~= egg then
-								Log("Switching egg after 3 fails","warn")
-								failedEggs[egg.part] = tick()
-								retryState[egg.part] = (retryState[egg.part] or 0) + 1
-							else
-								retryState[egg.part] = (retryState[egg.part] or 0) + 1
+                            local otherEgg = closestEgg(root)
 
-								if retryState[egg.part] >= 2 then
-									Log("Giving up on "..egg.part.Name,"error")
-									failedEggs[egg.part] = math.huge
-								else
-									Log("Retrying same egg (no alternatives)","warn")
-									pathFailures[egg.part] = 0
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-		task.wait(0.3)
-	end
+                            if otherEgg and otherEgg ~= egg then
+                                Log("Switching egg after 3 fails","warn")
+                                failedEggs[egg.part] = tick()
+                                retryState[egg.part] = (retryState[egg.part] or 0) + 1
+                            else
+                                retryState[egg.part] = (retryState[egg.part] or 0) + 1
+
+                                if retryState[egg.part] >= 2 then
+                                    Log("Giving up on "..egg.part.Name,"error")
+                                    failedEggs[egg.part] = math.huge
+                                else
+                                    Log("Retrying same egg (no alternatives)","warn")
+                                    pathFailures[egg.part] = 0
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(0.3)
+    end
 end)
